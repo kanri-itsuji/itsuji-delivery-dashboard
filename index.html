@@ -1014,15 +1014,11 @@ ${platformLines}
       "title": "見出し（15字程度）",
       "body": "考察本文。餃子中心の中華料理・宅配専業という業態特性、および分かる範囲での社会情勢・経済状況（物価、人件費、観光需要、宅配市場動向など）を踏まえた具体的な経営ヒントを2〜4文で。"
     }
-  ],
-  "citations": [
-    { "title": "情報源のタイトル", "url": "実際にWeb検索で見つけた正確なURL" }
   ]
 }
 
 # 注意事項
 - cardsは3〜4件作成してください。
-- citationsは、Web検索で実際に見つかった実在のURLのみを含めてください。見つからない場合は空配列 [] にしてください。URLを推測や創作で作らないでください。
 - 全体の文章量は日本語で800字程度に収めてください。
 - 数値は上記データに基づき、誇張や不正確な言い換えをしないでください。`;
 }
@@ -1089,6 +1085,9 @@ async function loadSavedAnalysis(){
   }
 }
 
+// Gemini APIへはCloudflare Worker経由でアクセスします（APIキーはWorker側のSecretに保管され、ここには含まれません）
+const WORKER_ENDPOINT = "https://bold-darkness-2826.kanri-bbe.workers.dev/";
+
 async function runAiAnalysis(){
   hideAnalysisError();
   setAnalysisLoading(true);
@@ -1096,24 +1095,31 @@ async function runAiAnalysis(){
     const ctx = computeAnalysisContext();
     const prompt = buildAnalysisPrompt(ctx);
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch(WORKER_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompt }],
-        tools: [{ type: "web_search_20250305", name: "web_search" }]
+        contents: [{ parts: [{ text: prompt }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { maxOutputTokens: 2000, temperature: 0.4 }
       })
     });
 
     if(!response.ok){
-      throw new Error(`API error: ${response.status}`);
+      const errBody = await response.text().catch(()=>'');
+      throw new Error(`API error: ${response.status} ${errBody.slice(0,200)}`);
     }
     const data = await response.json();
 
-    const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text);
-    let raw = textBlocks.join('\n').trim();
+    const candidate = data.candidates && data.candidates[0];
+    if(!candidate){
+      throw new Error('AIから応答が返りませんでした');
+    }
+
+    const parts = (candidate.content && candidate.content.parts) || [];
+    let raw = parts.map(p => p.text || '').join('\n').trim();
     raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/,'').replace(/```\s*$/,'').trim();
 
     let result;
@@ -1125,6 +1131,17 @@ async function runAiAnalysis(){
       else { throw new Error('AIの応答を解析できませんでした'); }
     }
 
+    // Google検索グラウンディングの実際の参照元URLを取得（モデルの自己申告ではなく実際の検索結果）
+    const groundingChunks = (candidate.groundingMetadata && candidate.groundingMetadata.groundingChunks) || [];
+    const seenUrls = new Set();
+    result.citations = groundingChunks
+      .map(c => c.web ? { title: c.web.title || c.web.uri, url: c.web.uri } : null)
+      .filter(c => {
+        if(!c || !c.url || seenUrls.has(c.url)) return false;
+        seenUrls.add(c.url);
+        return true;
+      });
+
     const savedAt = new Date().toISOString();
     renderAnalysisResult(result, `最終分析: ${new Date(savedAt).toLocaleString('ja-JP')}`);
 
@@ -1135,7 +1152,7 @@ async function runAiAnalysis(){
     }
 
   } catch(err){
-    showAnalysisError('分析の実行に失敗しました。この機能はClaudeのチャット内でこのファイルを開いている場合のみ利用できます（ダウンロードして単体で開いた場合は動作しません）。 詳細: ' + (err && err.message ? err.message : String(err)));
+    showAnalysisError('分析の実行に失敗しました。詳細: ' + (err && err.message ? err.message : String(err)));
   } finally {
     setAnalysisLoading(false);
   }
