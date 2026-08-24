@@ -1104,7 +1104,11 @@ async function runAiAnalysis(){
       },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 2000, temperature: 0.4 }
+        generationConfig: {
+          maxOutputTokens: 4000,
+          temperature: 0.4,
+          thinkingConfig: { thinkingBudget: 0 }
+        }
       })
     });
 
@@ -1120,7 +1124,8 @@ async function runAiAnalysis(){
     }
 
     const parts = (candidate.content && candidate.content.parts) || [];
-    let raw = parts.map(p => p.text || '').join('\n').trim();
+    // "thought": true が付いたパート（内部思考過程）は最終回答ではないため除外する
+    let raw = parts.filter(p => !p.thought).map(p => p.text || '').join('\n').trim();
     raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/,'').replace(/```\s*$/,'').trim();
 
     let result;
@@ -1128,8 +1133,13 @@ async function runAiAnalysis(){
       result = JSON.parse(raw);
     } catch(parseErr){
       const match = raw.match(/\{[\s\S]*\}/);
-      if(match){ result = JSON.parse(match[0]); }
-      else { throw new Error('AIの応答を解析できませんでした'); }
+      if(match){
+        try{ result = JSON.parse(match[0]); }
+        catch(e2){ throw new Error('AIの応答を解析できませんでした。応答内容(先頭300字): ' + raw.slice(0,300)); }
+      } else {
+        const finishReason = candidate.finishReason || '不明';
+        throw new Error(`AIの応答を解析できませんでした（終了理由: ${finishReason}）。応答内容(先頭300字): ` + (raw.slice(0,300) || '(空)'));
+      }
     }
 
     // Google検索グラウンディングの実際の参照元URLを取得（モデルの自己申告ではなく実際の検索結果）
