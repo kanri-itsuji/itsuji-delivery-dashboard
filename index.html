@@ -550,14 +550,32 @@ function loadLiveSheetData(){
           reject(new Error('シートの列構成が想定と異なります'));
           return;
         }
+        // gvizは日付型セルを Date(year, month0indexed, day) という生の値で返すことがある
+        // （スプレッドシート側でセルが日付として自動認識された場合に発生）。
+        // その場合は YYYY/MM 形式の文字列に正しく変換する。
+        function parseYmValue(cell){
+          if(!cell || cell.v === null || cell.v === undefined) return null;
+          const v = cell.v;
+          if(typeof v === 'string'){
+            const m = v.match(/^Date\((\d+),\s*(\d+),\s*(\d+)/);
+            if(m){
+              const y = Number(m[1]);
+              const mon = Number(m[2]) + 1; // gvizは月を0始まりで返す
+              return `${y}/${String(mon).padStart(2,'0')}`;
+            }
+            return v.trim();
+          }
+          return String(v).trim();
+        }
         const numVal = cell => (cell && typeof cell.v === 'number') ? cell.v : (cell && cell.v ? Number(cell.v) || 0 : 0);
         const records = [];
         table.rows.forEach(r=>{
           const c = r.c || [];
           const ymCell = c[iYm], platformCell = c[iPlatform], storeCell = c[iStore];
-          if(!ymCell || !ymCell.v || !platformCell || !platformCell.v || !storeCell || !storeCell.v) return;
+          const ym = parseYmValue(ymCell);
+          if(!ym || !platformCell || !platformCell.v || !storeCell || !storeCell.v) return;
           records.push({
-            ym: String(ymCell.v).trim(),
+            ym: ym,
             platform: String(platformCell.v).trim(),
             store: String(storeCell.v).trim(),
             Q: numVal(c[iQ]), PQ: numVal(c[iPQ]), P: numVal(c[iP]),
@@ -1192,6 +1210,35 @@ async function loadSavedAnalysis(){
 // Gemini APIへはCloudflare Worker経由でアクセスします（APIキーはWorker側のSecretに保管され、ここには含まれません）
 const WORKER_ENDPOINT = "https://bold-darkness-2826.kanri-bbe.workers.dev/";
 
+async function callGeminiWithRetry(requestBody, maxRetries=2){
+  let lastErr;
+  for(let attempt=0; attempt<=maxRetries; attempt++){
+    const response = await fetch(WORKER_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody)
+    });
+
+    if(response.ok){
+      return await response.json();
+    }
+
+    const errBody = await response.text().catch(()=>'');
+    const isTransient = response.status === 503 || response.status === 429 || response.status === 502;
+    lastErr = new Error(`API error: ${response.status} ${errBody.slice(0,200)}`);
+
+    if(isTransient && attempt < maxRetries){
+      await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
+      continue;
+    }
+    if(isTransient){
+      lastErr = new Error('現在Gemini側のサーバーが混雑しています。少し時間をおいて再度お試しください。');
+    }
+    throw lastErr;
+  }
+  throw lastErr;
+}
+
 async function runAiAnalysis(){
   hideAnalysisError();
   setAnalysisLoading(true);
@@ -1199,26 +1246,14 @@ async function runAiAnalysis(){
     const ctx = computeAnalysisContext();
     const prompt = buildAnalysisPrompt(ctx);
 
-    const response = await fetch(WORKER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: 4000,
-          temperature: 0.4,
-          thinkingConfig: { thinkingLevel: "minimal" }
-        }
-      })
+    const data = await callGeminiWithRetry({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 4000,
+        temperature: 0.4,
+        thinkingConfig: { thinkingLevel: "minimal" }
+      }
     });
-
-    if(!response.ok){
-      const errBody = await response.text().catch(()=>'');
-      throw new Error(`API error: ${response.status} ${errBody.slice(0,200)}`);
-    }
-    const data = await response.json();
 
     const candidate = data.candidates && data.candidates[0];
     if(!candidate){
