@@ -369,6 +369,26 @@
     </div>
   </div>
 
+  <div class="grid-2">
+    <div class="panel">
+      <h2>宅配比率（店舗別）</h2>
+      <div class="desc">店舗の総売上（店内＋宅配すべて込み）に対する、宅配売上の割合</div>
+      <table id="shareStoreTable">
+        <thead><tr><th>店舗</th><th>総売上</th><th>宅配売上</th><th>宅配比率</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty-note">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>宅配比率（業者別）</h2>
+      <div class="desc">全店舗の総売上に対する、各宅配業者の売上シェア</div>
+      <table id="sharePlatformTable">
+        <thead><tr><th>業者</th><th>売上</th><th>総売上比</th></tr></thead>
+        <tbody><tr><td colspan="3" class="empty-note">読み込み中…</td></tr></tbody>
+      </table>
+      <div class="desc" id="shareFootnote" style="margin-top:10px; font-size:11px;"></div>
+    </div>
+  </div>
+
   <div class="panel trend-panel">
     <h2>月次推移</h2>
     <div class="desc">全期間の推移。店舗・業者で絞り込みできます。</div>
@@ -380,6 +400,7 @@
           <button data-metric="MQ">MQ</button>
           <button data-metric="Q">Q</button>
           <button data-metric="MARGIN">粗利率(MQ/PQ)</button>
+          <button data-metric="SHARE">宅配比率</button>
         </div>
       </div>
       <div class="field">
@@ -485,9 +506,36 @@ const EMBEDDED_FALLBACK_DATA = [{"ym": "2020/08", "platform": "UberEats", "store
 // スプレッドシートのID（宅配数字報告）とシートのgid（タブ番号）
 const SHEET_ID = "1NqzC_Fi3NElnNq_PUDYsz5gnxOJu0ZdoCSgpWlnZxag";
 const SHEET_GID = "0";
+const TOTAL_SALES_GID = "1263518697";
+
+// スプレッドシート上の表記ゆれを吸収するための店舗名エイリアス
+const STORE_NAME_ALIASES = {
+  "カープ": "カープロード"
+};
+function normalizeStoreName(name){
+  return STORE_NAME_ALIASES[name] || name;
+}
+
+// gvizは日付型セルを Date(year, month0indexed, day) という生の値で返すことがあるため、
+// YYYY/MM 形式の文字列に統一する（両方のシートのローダーで共用）
+function parseYmValue(cell){
+  if(!cell || cell.v === null || cell.v === undefined) return null;
+  const v = cell.v;
+  if(typeof v === 'string'){
+    const m = v.match(/^Date\((\d+),\s*(\d+),\s*(\d+)/);
+    if(m){
+      const y = Number(m[1]);
+      const mon = Number(m[2]) + 1;
+      return `${y}/${String(mon).padStart(2,'0')}`;
+    }
+    return v.trim();
+  }
+  return String(v).trim();
+}
 
 let RAW_DATA = [];
 let allYms = [], allYears = [], allStores = [], allPlatforms = [];
+let TOTAL_SALES_DATA = []; // [{ym, store, totalSales}]
 
 function normalizeRow(d){
   const [y,m] = d.ym.split('/').map(Number);
@@ -550,23 +598,7 @@ function loadLiveSheetData(){
           reject(new Error('シートの列構成が想定と異なります'));
           return;
         }
-        // gvizは日付型セルを Date(year, month0indexed, day) という生の値で返すことがある
-        // （スプレッドシート側でセルが日付として自動認識された場合に発生）。
-        // その場合は YYYY/MM 形式の文字列に正しく変換する。
-        function parseYmValue(cell){
-          if(!cell || cell.v === null || cell.v === undefined) return null;
-          const v = cell.v;
-          if(typeof v === 'string'){
-            const m = v.match(/^Date\((\d+),\s*(\d+),\s*(\d+)/);
-            if(m){
-              const y = Number(m[1]);
-              const mon = Number(m[2]) + 1; // gvizは月を0始まりで返す
-              return `${y}/${String(mon).padStart(2,'0')}`;
-            }
-            return v.trim();
-          }
-          return String(v).trim();
-        }
+        // parseYmValue はモジュール共通関数（上部で定義済み）を使用する
         const numVal = cell => (cell && typeof cell.v === 'number') ? cell.v : (cell && cell.v ? Number(cell.v) || 0 : 0);
         const records = [];
         table.rows.forEach(r=>{
@@ -577,7 +609,7 @@ function loadLiveSheetData(){
           records.push({
             ym: ym,
             platform: String(platformCell.v).trim(),
-            store: String(storeCell.v).trim(),
+            store: normalizeStoreName(String(storeCell.v).trim()),
             Q: numVal(c[iQ]), PQ: numVal(c[iPQ]), P: numVal(c[iP]),
             V1Q: numVal(c[iV1Q]), V2Q: numVal(c[iV2Q]), MQ: numVal(c[iMQ])
           });
@@ -593,6 +625,62 @@ function loadLiveSheetData(){
     script.src = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?gid=${SHEET_GID}&tqx=out:json;responseHandler:${callbackName}`;
     script.onerror = ()=>{
       if(!settled){ settled = true; cleanup(); reject(new Error('スプレッドシートへの接続に失敗しました')); }
+    };
+    document.head.appendChild(script);
+  });
+}
+
+// 店舗ごとの月次「総売上（店内＋宅配すべて込み）」シートを取得する
+function loadTotalSalesData(){
+  return new Promise((resolve, reject)=>{
+    const callbackName = 'gvizCallback2_' + Date.now();
+    let settled = false;
+    const timeoutId = setTimeout(()=>{
+      if(!settled){ settled = true; cleanup(); reject(new Error('timeout')); }
+    }, 10000);
+
+    function cleanup(){
+      clearTimeout(timeoutId);
+      delete window[callbackName];
+      if(script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    window[callbackName] = function(response){
+      if(settled) return;
+      settled = true;
+      cleanup();
+      try{
+        const table = response.table;
+        const cols = table.cols.map(c => c.label);
+        const idx = name => cols.indexOf(name);
+        const iYm = idx('年月'), iStore = idx('店舗'), iTotal = idx('総売上(PQ)');
+        if(iYm < 0 || iStore < 0 || iTotal < 0){
+          reject(new Error('総売上シートの列構成が想定と異なります'));
+          return;
+        }
+        const numVal = cell => (cell && typeof cell.v === 'number') ? cell.v : (cell && cell.v ? Number(cell.v) || 0 : 0);
+        const records = [];
+        table.rows.forEach(r=>{
+          const c = r.c || [];
+          const ymCell = c[iYm], storeCell = c[iStore];
+          const ym = parseYmValue(ymCell);
+          if(!ym || !storeCell || !storeCell.v) return;
+          records.push({
+            ym: ym,
+            store: normalizeStoreName(String(storeCell.v).trim()),
+            totalSales: numVal(c[iTotal])
+          });
+        });
+        resolve(records);
+      } catch(e){
+        reject(e);
+      }
+    };
+
+    const script = document.createElement('script');
+    script.src = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?gid=${TOTAL_SALES_GID}&tqx=out:json;responseHandler:${callbackName}`;
+    script.onerror = ()=>{
+      if(!settled){ settled = true; cleanup(); reject(new Error('総売上シートへの接続に失敗しました')); }
     };
     document.head.appendChild(script);
   });
@@ -930,6 +1018,11 @@ function movingAverageN(labels, byYm, metric, period){
       windowYms.forEach(y=>{ sumPQ += byYm[y].PQ; sumMQ += byYm[y].MQ; });
       return sumPQ>0 ? sumMQ/sumPQ*100 : null;
     }
+    if(metric === 'SHARE'){
+      let sumPQ=0, sumTotal=0;
+      windowYms.forEach(y=>{ sumPQ += byYm[y].PQ; sumTotal += byYm[y].totalSales; });
+      return sumTotal>0 ? sumPQ/sumTotal*100 : null;
+    }
     let sum = 0;
     windowYms.forEach(y=>{ sum += byYm[y][metric]; });
     return sum / windowYms.length;
@@ -949,8 +1042,15 @@ function renderTrend(){
   if(trendPlatform) rows = rows.filter(r=>r.platform===trendPlatform);
 
   const byYm = {};
-  allYms.forEach(ym=>byYm[ym]={Q:0,PQ:0,MQ:0});
+  allYms.forEach(ym=>byYm[ym]={Q:0,PQ:0,MQ:0,totalSales:0});
   rows.forEach(r=>{ byYm[r.ym].Q+=r.Q; byYm[r.ym].PQ+=r.PQ; byYm[r.ym].MQ+=r.MQ; });
+
+  // 宅配比率の分母（総売上）: 店舗フィルタがあればその店舗のみ、なければ全店舗合計
+  let totalSalesRowsForTrend = TOTAL_SALES_DATA;
+  if(trendStore) totalSalesRowsForTrend = totalSalesRowsForTrend.filter(r=>r.store===trendStore);
+  totalSalesRowsForTrend.forEach(r=>{
+    if(byYm[r.ym]) byYm[r.ym].totalSales += r.totalSales;
+  });
 
   const labels = allYms;
   let dataVals;
@@ -958,6 +1058,9 @@ function renderTrend(){
   if(trendMetric === 'MARGIN'){
     dataVals = labels.map(ym => byYm[ym].PQ>0 ? byYm[ym].MQ/byYm[ym].PQ*100 : null);
     dataLabel = '粗利率(MQ/PQ) (%)';
+  } else if(trendMetric === 'SHARE'){
+    dataVals = labels.map(ym => byYm[ym].totalSales>0 ? byYm[ym].PQ/byYm[ym].totalSales*100 : null);
+    dataLabel = '宅配比率 (%)';
   } else {
     dataVals = labels.map(ym => byYm[ym][trendMetric] || null);
     dataLabel = METRIC_LABEL[trendMetric];
@@ -1011,14 +1114,15 @@ function renderTrend(){
         legend:{ display: hasMa, position:'top', align:'end', labels:{ boxWidth:14, font:{size:11, family:"'Zen Kaku Gothic New'"} } },
         tooltip:{ callbacks:{ label: c => {
           const lbl = c.dataset.label;
-          const v = trendMetric==='MARGIN' ? `${c.parsed.y.toFixed(1)}%` : (trendMetric==='Q' ? num(c.parsed.y) : yen(c.parsed.y));
+          const isPct = trendMetric==='MARGIN' || trendMetric==='SHARE';
+          const v = isPct ? `${c.parsed.y.toFixed(1)}%` : (trendMetric==='Q' ? num(c.parsed.y) : yen(c.parsed.y));
           return `${lbl}: ${v}`;
         } } }
       },
       scales:{
         x:{ ticks:{ font:{size:10, family:"'Roboto Mono'"}, maxRotation:70, minRotation:70 }, grid:{ display:false } },
         y:{ ticks:{ font:{size:10, family:"'Roboto Mono'"},
-              callback: v => trendMetric==='MARGIN' ? v+'%' : (trendMetric==='Q' ? num(v) : yen(v)) },
+              callback: v => (trendMetric==='MARGIN' || trendMetric==='SHARE') ? v+'%' : (trendMetric==='Q' ? num(v) : yen(v)) },
             grid:{ color:'#EFEAE0' } }
       }
     }
@@ -1027,9 +1131,86 @@ function renderTrend(){
   trendChartInst = new Chart(ctx, cfg);
 }
 
+function totalSalesRowsForYm(ym){ return TOTAL_SALES_DATA.filter(d=>d.ym===ym); }
+function totalSalesRowsForYear(y){
+  return TOTAL_SALES_DATA.filter(d=>{
+    const [yy] = d.ym.split('/').map(Number);
+    return yy === y;
+  });
+}
+
+function renderDeliveryShare(){
+  const storeTbody = document.querySelector('#shareStoreTable tbody');
+  const platformTbody = document.querySelector('#sharePlatformTable tbody');
+  const footnote = document.getElementById('shareFootnote');
+
+  if(TOTAL_SALES_DATA.length === 0){
+    storeTbody.innerHTML = '<tr><td colspan="4" class="empty-note">総売上データを読み込み中、または未取得です</td></tr>';
+    platformTbody.innerHTML = '<tr><td colspan="3" class="empty-note">総売上データを読み込み中、または未取得です</td></tr>';
+    footnote.textContent = '';
+    return;
+  }
+
+  let deliveryRows, totalSalesRows, periodLabel;
+  if(mode === 'month'){
+    deliveryRows = rowsForYm(selectedYm);
+    totalSalesRows = totalSalesRowsForYm(selectedYm);
+    periodLabel = selectedYm;
+  } else {
+    deliveryRows = rowsForYear(selectedYear);
+    totalSalesRows = totalSalesRowsForYear(selectedYear);
+    periodLabel = selectedYear + '年';
+  }
+
+  // 店舗ごとの総売上（複数月にまたがる場合は合算）
+  const totalSalesByStore = {};
+  totalSalesRows.forEach(r=>{ totalSalesByStore[r.store] = (totalSalesByStore[r.store]||0) + r.totalSales; });
+
+  // 店舗ごとの宅配売上（全業者合計）
+  const deliveryByStore = groupSum(deliveryRows, 'store');
+
+  const storeNames = Array.from(new Set([...Object.keys(totalSalesByStore), ...Object.keys(deliveryByStore)])).sort();
+
+  if(storeNames.length === 0){
+    storeTbody.innerHTML = `<tr><td colspan="4" class="empty-note">${periodLabel}の総売上データがありません</td></tr>`;
+  } else {
+    storeTbody.innerHTML = storeNames.map(name=>{
+      const total = totalSalesByStore[name];
+      const delivery = (deliveryByStore[name] && deliveryByStore[name].PQ) || 0;
+      if(total === undefined){
+        return `<tr><td>${name}</td><td class="empty-note">データなし</td><td>${yen(delivery)}</td><td class="empty-note">-</td></tr>`;
+      }
+      const ratio = total > 0 ? (delivery/total*100) : null;
+      const ratioTxt = ratio === null ? '-' : ratio.toFixed(1) + '%';
+      return `<tr><td>${name}</td><td>${yen(total)}</td><td>${yen(delivery)}</td><td>${ratioTxt}</td></tr>`;
+    }).join('');
+  }
+
+  // 業者別: 全店舗合計の総売上に対する各業者の売上シェア
+  const grandTotalSales = totalSalesRows.reduce((a,r)=>a+r.totalSales, 0);
+  const platformSums = groupSum(deliveryRows, 'platform');
+  const platformNames = Object.keys(platformSums).sort((a,b)=>platformSums[b].PQ - platformSums[a].PQ);
+
+  if(grandTotalSales === 0 || platformNames.length === 0){
+    platformTbody.innerHTML = `<tr><td colspan="3" class="empty-note">${periodLabel}の総売上データがありません</td></tr>`;
+  } else {
+    platformTbody.innerHTML = platformNames.map(name=>{
+      const sales = platformSums[name].PQ;
+      const ratio = sales / grandTotalSales * 100;
+      return `<tr><td>${name}</td><td>${yen(sales)}</td><td>${ratio.toFixed(1)}%</td></tr>`;
+    }).join('');
+  }
+
+  const missingStores = storeNames.filter(name => totalSalesByStore[name] === undefined);
+  footnote.textContent = missingStores.length > 0
+    ? `※総売上データがない店舗: ${missingStores.join('、')}（総売上比の算出対象からは除外されています）`
+    : '';
+}
+
 function renderAll(){
   renderReceipt();
   renderBreakdown();
+  renderDeliveryShare();
 }
 
 // 起動時: まず埋め込みデータ（取込時点のスナップショット）で即座に表示し、
@@ -1045,6 +1226,16 @@ loadLiveSheetData().then(records=>{
   setDataStatus(`自動取得: ${now}`);
 }).catch(err=>{
   setDataStatus('⚠ 最新データの自動取得に失敗（キャッシュ表示中）');
+});
+
+loadTotalSalesData().then(records=>{
+  TOTAL_SALES_DATA = records;
+  renderDeliveryShare();
+}).catch(err=>{
+  const storeTbody = document.querySelector('#shareStoreTable tbody');
+  const platformTbody = document.querySelector('#sharePlatformTable tbody');
+  if(storeTbody) storeTbody.innerHTML = '<tr><td colspan="4" class="empty-note">総売上データの取得に失敗しました</td></tr>';
+  if(platformTbody) platformTbody.innerHTML = '<tr><td colspan="3" class="empty-note">総売上データの取得に失敗しました</td></tr>';
 });
 
 // ===================== AI ANALYSIS (on-demand, via Anthropic API) =====================
